@@ -240,20 +240,31 @@ textarea.field{min-height:118px}
   function checkConfigured(){if(!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec(?:\?.*)?$/.test(WEB_APP_URL)){showToast('Сначала укажите URL Google Apps Script в index.html');return false;}return true;}
   function jsonpStatus(key,timeout=8000,action='status'){return new Promise((resolve,reject)=>{const cb='SOS_CALLBACK_'+randomKey(),script=document.createElement('script');let done=false;const timer=setTimeout(()=>end(new Error('Превышено время проверки')),timeout);function end(e,r){if(done)return;done=true;clearTimeout(timer);delete window[cb];script.remove();e?reject(e):resolve(r);}window[cb]=r=>end(null,r);script.onerror=()=>end(new Error('Нет связи с сервисом'));script.src=WEB_APP_URL+(WEB_APP_URL.includes('?')?'&':'?')+'action='+encodeURIComponent(action)+'&key='+encodeURIComponent(key)+'&callback='+cb+'&_='+Date.now();document.head.appendChild(script);});}
   const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-  async function submit(){if(sending)return;if(!data.name.trim()||data.name.trim().length<2)return setError('name','Как к вам обращаться? Достаточно имени.');if(!e164(data.phone))return setError('phone','Проверьте номер: после +7 должно быть 10 цифр.');if(!data.consent)return setError('consent','Поставьте галочку, чтобы мы могли передать заявку мастеру.');if(data.description.length>500)return setError('description','Сократите до 500 символов.');if(!checkConfigured())return;if(!tg?.initData){showToast('Откройте Mini App через кнопку бота в Telegram');return;}const safety=detectSafety(data.description);if(safety&&!data.safety_ack_at&&!data.safety_dismissed){enterSOS(safety.flag,safety.word);return;}sending=true;submittedSnapshot=generatePayload();data.screen='contact';render();bottom.querySelector('.btn')?.setAttribute('disabled','');saveDraft();
+  async function submit(){if(sending)return;if(!data.name.trim()||data.name.trim().length<2)return setError('name','Как к вам обращаться? Достаточно имени.');if(!e164(data.phone))return setError('phone','Проверьте номер: после +7 должно быть 10 цифр.');if(!data.consent)return setError('consent','Поставьте галочку, чтобы мы могли передать заявку мастеру.');if(data.description.length>500)return setError('description','Сократите до 500 символов.');if(!checkConfigured())return;if(!tg?.initData){showToast('Откройте Mini App через кнопку бота в Telegram');return;}
+    // Сессия Telegram старше 24 часов не пройдёт проверку на сервере — предупредим заранее.
+    const authDateSec=Number(tg?.initDataUnsafe?.auth_date||NaN);
+    if(Number.isFinite(authDateSec)&&(Date.now()/1000-authDateSec)>23*3600){showToast('Сессия Telegram истекла. Закройте и снова откройте приложение из Telegram.');return;}
+    const safety=detectSafety(data.description);if(safety&&!data.safety_ack_at&&!data.safety_dismissed){enterSOS(safety.flag,safety.word);return;}sending=true;submittedSnapshot=generatePayload();data.screen='contact';render();bottom.querySelector('.btn')?.setAttribute('disabled','');saveDraft();
     // Отправка и проверка результата идут параллельно: no-cors не позволяет читать HTTP-ответ GAS.
     // Проверяем только выдаваемый сервером номер по уникальному ключу, никогда не придумываем его.
-    let postError=null;const ctrl=new AbortController();const abortTimer=setTimeout(()=>ctrl.abort(),12000);
-    const postPromise=fetch(WEB_APP_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(submittedSnapshot),signal:ctrl.signal,redirect:'follow'}).catch(err=>{postError=err;}).finally(()=>clearTimeout(abortTimer));
-    let result=null,serverError='';const startWait=Date.now();
+    let postError=null,postFinished=false;const ctrl=new AbortController();
+    // Для больших фото даём POST до 60 с; проверка статуса живёт ДОЛЬШЕ POST.
+    const postBody=JSON.stringify(submittedSnapshot);
+    const abortMs=postBody.length>500000?60000:20000;
+    const abortTimer=setTimeout(()=>ctrl.abort(),abortMs);
+    const postPromise=fetch(WEB_APP_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:postBody,signal:ctrl.signal,redirect:'follow'}).catch(err=>{postError=err;}).finally(()=>{postFinished=true;clearTimeout(abortTimer);});
+    let result=null,serverError='',serviceVersion='',pollAnswered=false;const startWait=Date.now();
     await sleep(700);
-    for(let n=0;n<8&&Date.now()-startWait<17500;n++){
+    for(let n=0;Date.now()-startWait<abortMs+12000;n++){
       try{const r=await jsonpStatus(data.idempotency_key,2500);
+        if(r){pollAnswered=true;if(r.service_version)serviceVersion=r.service_version;}
         if(r&&r.ok&&r.found&&r.request_id){result=r;break;}
-        if(r&&r.ok===false&&r.error){serverError=r.error;break;}
+        if(r&&r.ok===false&&r.error){serverError=r.error;if(postFinished&&Date.now()-startWait>4000)break;}
       }catch(err){console.warn('Проверка заявки:',err.message);}
-      if(n<7)await sleep(650);
+      await sleep(650);
     }
+    // Ответ JSONP без метки версии = на /exec развёрнута устаревшая версия Apps Script.
+    if(pollAnswered&&!serviceVersion)serverError=serverError||'Похоже, на сервере развёрнута устаревшая версия Apps Script. Владельцу нужно обновить развёртывание (Deploy → Manage deployments → новая версия).';
     if(!result)ctrl.abort(); // поздний POST прерывается; на сервере мог успеть сохраниться
     void postPromise;
     sending=false;if(result){data.request_id=result.request_id;data.promo_type=result.promo_type||'none';data.discount_percent=Number(result.discount_percent)||0;data.discount_status=result.discount_status||'';data.notification_delivery_status=result.notification_delivery_status||'pending';data.status=result.status||'new';referralInviteCode=result.invite_code||'';data.submitted_at=new Date().toISOString();haptic('success');historyStack=[];go('success',true);hasOldDraft=false;setTimeout(refreshStatus,4500);return;}data.server_error=serverError||'Нет подтверждения от сервера. Проверьте доступ к Web App и Script Properties. Ответы сохранены.';data.screen='send-error';saveDraft();render();haptic('error');if(postError)console.warn('Сеть / запрос:',postError.message);}
